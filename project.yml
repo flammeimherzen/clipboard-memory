@@ -1,0 +1,62 @@
+name: ClipboardMemory
+options:
+  minimumXcodeGenVersion: 2.42.0
+  createIntermediateGroups: true
+  groupSortPosition: top
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: TQA73XJF6K
+    CODE_SIGN_IDENTITY: Apple Development
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_APP_SANDBOX: NO
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+packages:
+  KeyboardShortcuts:
+    url: https://github.com/sindresorhus/KeyboardShortcuts
+    exactVersion: 3.1.0
+targets:
+  ClipboardMemory:
+    type: application
+    platform: macOS
+    sources:
+      - path: ClipboardMemory
+    dependencies:
+      - package: KeyboardShortcuts
+        product: KeyboardShortcuts
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.belzephyrus.ClipboardMemory
+        PRODUCT_NAME: ClipboardMemory
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_LSUIElement: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Clipboard Memory
+  ClipboardMemoryTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: ClipboardMemoryTests
+    dependencies:
+      - target: ClipboardMemory
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.belzephyrus.ClipboardMemoryTests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/ClipboardMemory.app/Contents/MacOS/ClipboardMemory"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  ClipboardMemory:
+    build:
+      targets:
+        ClipboardMemory: all
+        ClipboardMemoryTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - ClipboardMemoryTests
