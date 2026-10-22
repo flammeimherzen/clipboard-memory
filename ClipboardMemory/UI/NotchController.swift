@@ -17,7 +17,7 @@ enum NotchLayout {
         case .hover:
             size = NSSize(width: notch.width + 28, height: notch.height + 34)
         case .open:
-            size = NSSize(width: 780, height: min(notch.height + 480, visibleFrame.height - 20))
+            size = NSSize(width: 940, height: min(notch.height + 480, visibleFrame.height - 20))
         }
         var rect = NSRect(
             x: notch.midX - size.width / 2,
@@ -246,6 +246,7 @@ final class NotchController: NSObject {
             animateFrame(to: windowFrame(for: .hover), duration: 0.22)
         case .open:
             model.showsContent = false
+            store.archivePastDaysIfNeeded()
             session.reset(in: store)
             monitor.refreshAccessNotice()
             panel.allowsKey = true
@@ -355,6 +356,10 @@ final class NotchController: NSObject {
         let command = flags.contains(.command)
         switch keyCode {
         case 53:
+            if session.selectedDayID != nil {
+                session.showToday(in: store)
+                return true
+            }
             setPhase(.idle)
             return true
         case 36, 76:
@@ -377,7 +382,18 @@ final class NotchController: NSObject {
         }
         if lowered == "p" {
             guard let id = session.selection else { return true }
+            let dayID = session.selectedDayID
             store.togglePin(id: id)
+            if let dayID, !store.archivedDays.contains(where: { $0.id == dayID }) {
+                session.showToday(in: store)
+                return true
+            }
+            let visible = session.visibleItems(in: store)
+            if visible.contains(where: { $0.id == id }) {
+                session.selection = id
+            } else {
+                session.selection = visible.first?.id
+            }
             return true
         }
         if keyCode == 51 {
@@ -416,9 +432,14 @@ final class NotchController: NSObject {
 
     private func deleteSelection() {
         guard let id = session.selection else { return }
+        let dayID = session.selectedDayID
         let visible = session.visibleItems(in: store)
         let currentIndex = visible.firstIndex { $0.id == id }
         store.delete(id: id)
+        if let dayID, !store.archivedDays.contains(where: { $0.id == dayID }) {
+            session.showToday(in: store)
+            return
+        }
         let updated = session.visibleItems(in: store)
         if let currentIndex, updated.indices.contains(currentIndex) {
             session.selection = updated[currentIndex].id

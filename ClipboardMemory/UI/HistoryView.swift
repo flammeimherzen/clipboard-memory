@@ -15,9 +15,24 @@ final class HistorySession {
     var query = ""
     var filter: ClipFilter = .all
     var selection: UUID?
+    var selectedDayID: String?
     weak var searchField: NSSearchField?
 
     func reset(in store: HistoryStore) {
+        store.archivePastDaysIfNeeded()
+        showToday(in: store)
+    }
+
+    func openDay(_ id: String, in store: HistoryStore) {
+        selectedDayID = id
+        query = ""
+        filter = .all
+        searchField?.stringValue = ""
+        selection = visibleItems(in: store).first?.id
+    }
+
+    func showToday(in store: HistoryStore) {
+        selectedDayID = nil
         query = ""
         filter = .all
         searchField?.stringValue = ""
@@ -26,7 +41,7 @@ final class HistorySession {
 
     func visibleItems(in store: HistoryStore) -> [ClipItem] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return store.sortedItems.filter { item in
+        return baseItems(in: store).filter { item in
             switch filter {
             case .all:
                 break
@@ -46,6 +61,17 @@ final class HistorySession {
             }
         }
     }
+
+    private func baseItems(in store: HistoryStore) -> [ClipItem] {
+        if let selectedDayID,
+           let day = store.archivedDays.first(where: { $0.id == selectedDayID }) {
+            return day.items.sorted { lhs, rhs in
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
+                return lhs.id.uuidString > rhs.id.uuidString
+            }
+        }
+        return store.sortedItems
+    }
 }
 
 @MainActor
@@ -54,6 +80,22 @@ enum ClipFormatting {
         let formatter = RelativeDateTimeFormatter()
         formatter.locale = Locale(identifier: "en_US")
         formatter.unitsStyle = .short
+        return formatter
+    }()
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter
+    }()
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
         return formatter
     }()
 
@@ -69,10 +111,20 @@ enum ClipFormatting {
         }
     }
 
-    static func subtitle(for item: ClipItem) -> String {
-        let time = relative.localizedString(for: item.lastUsedAt, relativeTo: Date())
+    static func subtitle(for item: ClipItem, exactTime: Bool = false) -> String {
+        let time = exactTime
+            ? timeFormatter.string(from: item.createdAt)
+            : relative.localizedString(for: item.lastUsedAt, relativeTo: Date())
         guard let name = item.sourceAppName, !name.isEmpty else { return time }
         return "\(name) · \(time)"
+    }
+
+    static func todayTitle(for date: Date) -> String {
+        "Today · \(dayTitle(for: date))"
+    }
+
+    static func dayTitle(for date: Date) -> String {
+        dayFormatter.string(from: date)
     }
 }
 
@@ -91,10 +143,22 @@ struct HistoryView: View {
     var onQuit: () -> Void
 
     @State private var confirmClear = false
+    @State private var confirmDeleteDay = false
+    @State private var dayPendingDelete: String?
+
+    private var pastDay: DayArchive? {
+        store.archivedDays.first { $0.id == session.selectedDayID }
+    }
+
+    private var todayHeading: String {
+        _ = store.currentDayID
+        return ClipFormatting.todayTitle(for: store.currentDate)
+    }
 
     var body: some View {
         let visible = session.visibleItems(in: store)
         VStack(spacing: 10) {
+            dayBar
             SearchField(text: session.query, dark: chrome == .notch) { newValue in
                 session.query = newValue
                 session.selection = session.visibleItems(in: store).first?.id
@@ -108,6 +172,10 @@ struct HistoryView: View {
 
             HStack(spacing: 0) {
                 list(visible)
+                if !store.archivedDays.isEmpty {
+                    Divider()
+                    dayColumn
+                }
                 Divider()
                 PreviewPane(
                     item: visible.first { $0.id == session.selection } ?? visible.first,
@@ -140,43 +208,144 @@ struct HistoryView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This deletes \(store.unpinnedCount) unpinned items. Pinned items stay.")
+            Text("This deletes \(store.unpinnedCount) unpinned items from today. Pinned items and earlier days stay.")
         }
+        .alert("Delete this day?", isPresented: $confirmDeleteDay) {
+            Button("Delete", role: .destructive) {
+                if let id = dayPendingDelete {
+                    store.deleteDay(id: id)
+                    if session.selectedDayID == id {
+                        session.showToday(in: store)
+                    }
+                }
+                dayPendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) {
+                dayPendingDelete = nil
+            }
+        } message: {
+            Text("This deletes the folder and everything copied that day.")
+        }
+    }
+
+    private var dayBar: some View {
+        HStack(spacing: 8) {
+            if let pastDay {
+                Button {
+                    session.showToday(in: store)
+                } label: {
+                    Label("Today", systemImage: "chevron.backward")
+                }
+                .help("Back to today")
+                Text(ClipFormatting.dayTitle(for: pastDay.date))
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(itemCount(pastDay.items.count))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Button(role: .destructive) {
+                    dayPendingDelete = pastDay.id
+                    confirmDeleteDay = true
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .help("Delete this day")
+            } else {
+                Image(systemName: "calendar")
+                    .foregroundStyle(.secondary)
+                Text(todayHeading)
+                    .font(.headline)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+            }
+        }
+        .buttonStyle(.borderless)
+    }
+
+    private var dayColumn: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Days")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 4)
+                dayButton(
+                    title: "Today",
+                    subtitle: itemCount(store.items.count),
+                    systemImage: "calendar",
+                    tint: .secondary,
+                    isSelected: pastDay == nil
+                ) {
+                    guard session.selectedDayID != nil else { return }
+                    session.showToday(in: store)
+                }
+                ForEach(store.archivedDays) { day in
+                    dayButton(
+                        title: ClipFormatting.dayTitle(for: day.date),
+                        subtitle: itemCount(day.items.count),
+                        systemImage: "folder.fill",
+                        tint: .yellow,
+                        isSelected: day.id == session.selectedDayID
+                    ) {
+                        guard session.selectedDayID != day.id else { return }
+                        session.openDay(day.id, in: store)
+                    }
+                    .contextMenu {
+                        Button("Delete Day", role: .destructive) {
+                            dayPendingDelete = day.id
+                            confirmDeleteDay = true
+                        }
+                    }
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(width: 176)
+    }
+
+    private func dayButton(
+        title: String,
+        subtitle: String,
+        systemImage: String,
+        tint: Color,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(tint)
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .buttonStyle(DayRowButtonStyle(isSelected: isSelected))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityLabel("\(title), \(subtitle)")
     }
 
     private func list(_ visible: [ClipItem]) -> some View {
         Group {
-            if store.items.isEmpty {
+            if visible.isEmpty {
                 emptyState(
-                    title: "Nothing yet",
-                    text: "Copy text or an image and it will show up here."
+                    title: emptyTitle,
+                    text: emptyMessage
                 )
-            } else if visible.isEmpty {
-                emptyState(title: "No matches", text: "Try a different search.")
             } else {
                 List(selection: $session.selection) {
                     ForEach(visible) { item in
-                        Button {
-                            onCommit(item)
-                        } label: {
-                            ClipRow(item: item, store: store)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .buttonStyle(.plain)
-                        .tag(item.id)
-                        .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
-                        .listRowBackground(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(item.id == session.selection ? Color.accentColor.opacity(0.35) : Color.clear)
-                        )
-                        .contextMenu {
-                            Button(item.isPinned ? "Unpin" : "Pin") {
-                                store.togglePin(id: item.id)
-                            }
-                            Button("Delete", role: .destructive) {
-                                store.delete(id: item.id)
-                            }
-                        }
+                        clipButton(item)
                     }
                 }
                 .listStyle(.plain)
@@ -184,6 +353,70 @@ struct HistoryView: View {
             }
         }
         .frame(width: 340)
+    }
+
+    private var emptyTitle: String {
+        if !session.query.isEmpty || session.filter != .all {
+            return "No matches"
+        }
+        if pastDay == nil && store.items.isEmpty && !store.archivedDays.isEmpty {
+            return "Nothing copied today"
+        }
+        if store.items.isEmpty && store.archivedDays.isEmpty {
+            return "Nothing yet"
+        }
+        return "No matches"
+    }
+
+    private var emptyMessage: String {
+        if !session.query.isEmpty || session.filter != .all {
+            return "Try a different search."
+        }
+        if pastDay == nil && store.items.isEmpty && !store.archivedDays.isEmpty {
+            return "Earlier copies are in the day folders."
+        }
+        if store.items.isEmpty && store.archivedDays.isEmpty {
+            return "Copy text or an image and it will show up here."
+        }
+        return "Try a different search."
+    }
+
+    private func clipButton(_ item: ClipItem) -> some View {
+        Button {
+            onCommit(item)
+        } label: {
+            ClipRow(item: item, store: store, showsExactTime: pastDay != nil)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .tag(item.id)
+        .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+        .listRowBackground(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(item.id == session.selection ? Color.accentColor.opacity(0.35) : Color.clear)
+        )
+        .contextMenu {
+            Button(item.isPinned ? "Unpin" : "Pin") {
+                let dayID = session.selectedDayID
+                store.togglePin(id: item.id)
+                restoreTodayIfNeeded(dayID)
+            }
+            Button("Delete", role: .destructive) {
+                let dayID = session.selectedDayID
+                store.delete(id: item.id)
+                restoreTodayIfNeeded(dayID)
+            }
+        }
+    }
+
+    private func restoreTodayIfNeeded(_ dayID: String?) {
+        guard let dayID, !store.archivedDays.contains(where: { $0.id == dayID }) else { return }
+        session.showToday(in: store)
+    }
+
+    private func itemCount(_ count: Int) -> String {
+        count == 1 ? "1 item" : "\(count) items"
     }
 
     private func emptyState(title: String, text: String) -> some View {
@@ -203,8 +436,15 @@ struct HistoryView: View {
             Button(store.isPaused ? "Resume" : "Pause") {
                 store.isPaused.toggle()
             }
-            Button("Clear") { confirmClear = true }
-                .disabled(store.unpinnedCount == 0)
+            if pastDay != nil {
+                Button("Delete Day") {
+                    dayPendingDelete = session.selectedDayID
+                    confirmDeleteDay = true
+                }
+            } else {
+                Button("Clear") { confirmClear = true }
+                    .disabled(store.unpinnedCount == 0)
+            }
             Text("\(visibleCount)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -216,6 +456,29 @@ struct HistoryView: View {
             Button("Quit") { onQuit() }
         }
         .buttonBorderShape(chrome == .notch ? .capsule : .automatic)
+    }
+}
+
+private struct DayRowButtonStyle: ButtonStyle {
+    var isSelected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(rowFill(isPressed: configuration.isPressed))
+            )
+            .contentShape(Rectangle())
+    }
+
+    private func rowFill(isPressed: Bool) -> Color {
+        if isSelected {
+            return Color.accentColor.opacity(isPressed ? 0.5 : 0.35)
+        }
+        return isPressed ? Color.white.opacity(0.08) : Color.clear
     }
 }
 

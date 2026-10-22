@@ -41,3 +41,9 @@ extension ClipItem: Hashable {
         hasher.combine(id)
     }
 }
+
+struct DayArchive: Identifiable, Sendable {
+    var id: String
+    var date: Date
+    var items: [ClipItem]
+}

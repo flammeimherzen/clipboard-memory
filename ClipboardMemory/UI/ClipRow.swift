@@ -4,6 +4,7 @@ import SwiftUI
 struct ClipRow: View {
     let item: ClipItem
     let store: HistoryStore
+    var showsExactTime = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -17,7 +18,7 @@ struct ClipRow: View {
                             .resizable()
                             .frame(width: 12, height: 12)
                     }
-                    Text(ClipFormatting.subtitle(for: item))
+                    Text(ClipFormatting.subtitle(for: item, exactTime: showsExactTime))
                         .lineLimit(1)
                         .font(.caption)
                         .foregroundStyle(.secondary)

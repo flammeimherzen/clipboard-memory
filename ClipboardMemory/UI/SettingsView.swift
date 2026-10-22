@@ -66,7 +66,7 @@ struct SettingsView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This deletes \(store.unpinnedCount) unpinned items. Pinned items stay.")
+            Text("This deletes \(store.unpinnedCount) unpinned items from today. Pinned items and earlier days stay.")
         }
     }
 
