@@ -152,8 +152,18 @@ struct ClipboardReaderTests {
         defer { imageBoard.releaseGlobally() }
         let imageItem = try #require(store.items.first { $0.kind == .image })
         #expect(PasteboardWriter.write(imageItem, using: store, pasteboard: imageBoard) != nil)
+        store.delete(id: imageItem.id)
         #expect(imageBoard.data(forType: .png) == png)
         #expect(imageBoard.data(forType: .tiff) != nil)
+
+        let jpeg = try #require(NSBitmapImageRep(data: png)?.representation(using: .jpeg, properties: [:]))
+        store.addImage(data: jpeg, fileExtension: "jpg", source: nil)
+        let jpegItem = try #require(store.items.first { $0.kind == .image })
+        #expect(PasteboardWriter.write(jpegItem, using: store, pasteboard: imageBoard) != nil)
+        store.delete(id: jpegItem.id)
+        #expect(imageBoard.data(forType: NSPasteboard.PasteboardType("public.jpeg")) == jpeg)
+        #expect(imageBoard.data(forType: .png).flatMap(NSBitmapImageRep.init(data:))?.pixelsWide == 1)
+        #expect(imageBoard.data(forType: .tiff).flatMap(NSBitmapImageRep.init(data:))?.pixelsHigh == 1)
     }
 
     @Test func uniquePasteboardTypesReachDecide() {

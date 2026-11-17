@@ -53,9 +53,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func commit(_ item: ClipItem) {
         guard let store, let monitor else { return }
-        if let changeCount = PasteboardWriter.write(item, using: store) {
-            monitor.noteOwnChange(changeCount)
-        }
+        guard let changeCount = PasteboardWriter.write(item, using: store) else { return }
+        monitor.noteOwnChange(changeCount)
         store.touch(id: item.id)
         notch?.close()
     }

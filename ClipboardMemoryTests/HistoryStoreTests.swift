@@ -118,6 +118,96 @@ struct HistoryStoreTests {
         #expect(broken.count == 1)
     }
 
+    @Test func corruptIndexPreservesSidecarsAcrossRelaunches() throws {
+        let fixture = TestStore()
+        defer { fixture.cleanup() }
+        let text = String(repeating: "Ж", count: HistoryStore.inlineTextBytes)
+        let image = Data("image bytes".utf8)
+        fixture.store.addText(text, source: nil)
+        fixture.store.addImage(data: image, fileExtension: "png", source: nil)
+        let textURL = fixture.store.url(forRelative: try #require(fixture.store.items[0].textFileName))
+        let imageURL = fixture.store.url(forRelative: try #require(fixture.store.items[1].imageFileName))
+        #expect(fixture.store.flush())
+        try Data("{".utf8).write(to: fixture.root.appending(path: "history.json"))
+        // Simulate an older installation without a recovery index.
+        try FileManager.default.removeItem(at: fixture.root.appending(path: "history.json.backup"))
+        let recovered = HistoryStore(root: fixture.root, defaults: fixture.defaults)
+        recovered.addText("new copy", source: nil)
+        #expect(recovered.flush())
+        let reopened = HistoryStore(root: fixture.root, defaults: fixture.defaults)
+        #expect(reopened.items.first?.text == "new copy")
+        #expect(try Data(contentsOf: textURL) == Data(text.utf8))
+        #expect(try Data(contentsOf: imageURL) == image)
+    }
+
+    @Test func backupRestoresCommittedContentsAndHonorsDeletion() throws {
+        let fixture = TestStore()
+        defer { fixture.cleanup() }
+        let large = String(repeating: "Ж", count: HistoryStore.inlineTextBytes)
+        fixture.store.addText("short", source: nil)
+        fixture.store.addText(large, source: nil)
+        fixture.store.addText("deleted", source: nil)
+        #expect(fixture.store.flush())
+        fixture.store.delete(id: try #require(fixture.store.items.last?.id))
+        #expect(fixture.store.flush())
+        try Data("{".utf8).write(to: fixture.root.appending(path: "history.json"))
+
+        let recovered = HistoryStore(root: fixture.root, defaults: fixture.defaults)
+        #expect(recovered.items.compactMap { recovered.text(for: $0) } == ["short", large])
+    }
+
+    @Test func unreadableArchiveIsNotOverwrittenDuringRollover() throws {
+        let calendar = utcCalendar()
+        let clock = ManualClock(date(2026, 10, 21, 12, calendar: calendar))
+        let fixture = TestStore(calendar: calendar, now: { clock.date })
+        defer { fixture.cleanup() }
+        fixture.store.addText("pending rollover", source: nil)
+        #expect(fixture.store.flush())
+        let folder = fixture.root.appending(path: "days/2026-10-21")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let index = folder.appending(path: "items.json")
+        let broken = Data("{".utf8)
+        try broken.write(to: index)
+        clock.date = date(2026, 10, 22, 12, calendar: calendar)
+        let reopened = HistoryStore(root: fixture.root, defaults: fixture.defaults, calendar: calendar, now: { clock.date })
+        #expect(reopened.items.first?.text == "pending rollover")
+        #expect(try Data(contentsOf: index) == broken)
+    }
+
+    @Test func fractionalTimesSurviveReloadAndLegacyDatesStillOpen() throws {
+        let today = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
+        let clock = ManualClock(today.addingTimeInterval(0.1))
+        let fixture = TestStore(now: { clock.date })
+        defer { fixture.cleanup() }
+        fixture.store.addText("first", source: nil)
+        clock.date = today.addingTimeInterval(0.2)
+        fixture.store.addText("second", source: nil)
+        let expected = fixture.store.sortedItems
+        #expect(fixture.store.flush())
+        let reopened = HistoryStore(root: fixture.root, defaults: fixture.defaults, now: { clock.date })
+        #expect(reopened.sortedItems.map(\.text) == ["second", "first"])
+        #expect(reopened.sortedItems.map(\.lastUsedAt) == expected.map(\.lastUsedAt))
+
+        let legacyEncoder = JSONEncoder()
+        legacyEncoder.dateEncodingStrategy = .iso8601
+        try legacyEncoder.encode(expected).write(to: fixture.root.appending(path: "history.json"))
+        let legacy = HistoryStore(root: fixture.root, defaults: fixture.defaults, now: { clock.date })
+        #expect(legacy.items.map(\.id) == expected.map(\.id))
+    }
+
+    @Test func searchFindsUnicodeAtEndOfExternalText() async {
+        let fixture = TestStore()
+        defer { fixture.cleanup() }
+        fixture.store.addText(String(repeating: "a", count: 100_000) + "Ёжик", source: nil)
+        let session = HistorySession()
+        session.query = "ёжик"
+        await session.updateSearch(session.searchRequest(in: fixture.store))
+        #expect(session.visibleItems(in: fixture.store).map(\.id) == fixture.store.items.map(\.id))
+        session.query = "absent"
+        await session.updateSearch(session.searchRequest(in: fixture.store))
+        #expect(session.visibleItems(in: fixture.store).isEmpty)
+    }
+
     @Test func saveAndReloadRoundTrip() {
         let fixture = TestStore()
         defer { fixture.cleanup() }
@@ -130,11 +220,12 @@ struct HistoryStoreTests {
         #expect(reloaded.items[0].sourceAppName == "TextEdit")
     }
 
-    @Test func removesOrphanFilesOnLoad() throws {
+    @Test func removesOrphanFilesWithValidIndex() throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "ClipboardMemoryTests-\(UUID().uuidString)", directoryHint: .isDirectory)
         let images = root.appending(path: "images", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        try Data("[]".utf8).write(to: root.appending(path: "history.json"))
         let orphan = images.appending(path: "orphan.png")
         try Data("x".utf8).write(to: orphan)
         let suite = "ClipboardMemoryTests.\(UUID().uuidString)"
@@ -169,7 +260,7 @@ struct HistoryStoreTests {
         #expect(fixture.store.items.count == 1)
     }
 
-    @Test func searchAndFilterUseVisibleItems() {
+    @Test func searchAndFilterUseVisibleItems() async {
         let fixture = TestStore()
         defer { fixture.cleanup() }
         fixture.store.addText("Альфа", source: nil)
@@ -182,11 +273,13 @@ struct HistoryStoreTests {
 
         #expect(session.visibleItems(in: fixture.store).count == 2)
         session.query = "аль"
+        await session.updateSearch(session.searchRequest(in: fixture.store))
         #expect(session.visibleItems(in: fixture.store).map { fixture.store.text(for: $0) } == ["Альфа"])
         session.query = ""
         session.filter = .image
         #expect(session.visibleItems(in: fixture.store).count == 1)
         session.query = "preview"
+        await session.updateSearch(session.searchRequest(in: fixture.store))
         #expect(session.visibleItems(in: fixture.store).first?.kind == .image)
     }
 

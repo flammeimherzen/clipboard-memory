@@ -19,9 +19,12 @@ final class HistoryStore {
     private let calendar: Calendar
     private let now: @MainActor () -> Date
     private let dayObserver = NotificationToken()
-    private var textCache: [UUID: String] = [:]
+    // Only the selected preview needs the full sidecar between view updates.
+    @ObservationIgnored private var cachedText: (id: UUID, value: String)?
+    private var canSaveLiveIndex = true
+    private var unreadableDays = Set<String>()
     private var saveTask: Task<Void, Never>?
-    private var saveGeneration = 0
+    private static var saveGeneration = 0
     private var isArchiving = false
 
     var historyLimit: Int {
@@ -166,17 +169,17 @@ final class HistoryStore {
 
     func text(for item: ClipItem) -> String? {
         if let text = item.text { return text }
-        if let cached = textCache[item.id] { return cached }
+        if cachedText?.id == item.id { return cachedText?.value }
         guard let name = item.textFileName,
               let data = try? Data(contentsOf: url(forRelative: name)),
               let text = String(data: data, encoding: .utf8) else { return nil }
-        textCache[item.id] = text
+        cachedText = (item.id, text)
         return text
     }
 
     func imageData(for item: ClipItem) -> Data? {
         guard let imageFileName = item.imageFileName else { return nil }
-        return try? Data(contentsOf: url(forRelative: imageFileName))
+        return try? Data(contentsOf: url(forRelative: imageFileName), options: .mappedIfSafe)
     }
 
     func url(forRelative relative: String) -> URL {
@@ -188,30 +191,30 @@ final class HistoryStore {
     func delete(id: UUID) {
         if let item = items.first(where: { $0.id == id }) {
             removeFiles(of: item)
-            textCache[id] = nil
+            if cachedText?.id == id { cachedText = nil }
             items.removeAll { $0.id == id }
             scheduleSave()
             return
         }
         guard let dayIndex = archivedDays.firstIndex(where: { $0.items.contains(where: { $0.id == id }) }),
               let item = archivedDays[dayIndex].items.first(where: { $0.id == id }) else { return }
-        textCache[id] = nil
-        archivedDays[dayIndex].items.removeAll { $0.id == id }
-        if archivedDays[dayIndex].items.isEmpty {
+        if cachedText?.id == id { cachedText = nil }
+        var updated = archivedDays[dayIndex]
+        updated.items.removeAll { $0.id == id }
+        if updated.items.isEmpty {
             let dayID = archivedDays[dayIndex].id
             archivedDays.remove(at: dayIndex)
             removeDayFolder(dayID)
         } else {
-            writeDay(archivedDays[dayIndex])
+            guard writeDay(updated) else { return }
+            archivedDays[dayIndex] = updated
             removeFiles(of: item)
         }
     }
 
     func deleteDay(id: String) {
-        guard let day = archivedDays.first(where: { $0.id == id }) else { return }
-        for item in day.items {
-            textCache[item.id] = nil
-        }
+        guard archivedDays.contains(where: { $0.id == id }) else { return }
+        cachedText = nil
         archivedDays.removeAll { $0.id == id }
         removeDayFolder(id)
     }
@@ -236,7 +239,7 @@ final class HistoryStore {
         let victims = items.filter { !$0.isPinned }
         for item in victims {
             removeFiles(of: item)
-            textCache[item.id] = nil
+            if cachedText?.id == item.id { cachedText = nil }
         }
         items.removeAll { !$0.isPinned }
         scheduleSave()
@@ -265,7 +268,7 @@ final class HistoryStore {
 
         var removals: [String] = []
         var moved: Set<UUID> = []
-        for (id, group) in grouped {
+        for (id, group) in grouped where !unreadableDays.contains(id) {
             let existingIDs = Set(archivedDays.first(where: { $0.id == id })?.items.map(\.id) ?? [])
             var fresh: [ClipItem] = []
             for item in group {
@@ -310,20 +313,12 @@ final class HistoryStore {
 
     @discardableResult
     func flush() -> Bool {
-        saveGeneration += 1
-        let generation = saveGeneration
+        Self.saveGeneration += 1
+        let generation = Self.saveGeneration
         saveTask?.cancel()
         saveTask = nil
         guard let data = encodedData() else { return false }
-        let url = historyFileURL
-        let box = ResultBox()
-        let semaphore = DispatchSemaphore(value: 0)
-        Task.detached {
-            box.ok = await HistoryFileWriter.shared.write(data: data, url: url, generation: generation)
-            semaphore.signal()
-        }
-        semaphore.wait()
-        return box.ok
+        return HistoryFileWriter.shared.flush(data: data, url: historyFileURL, generation: generation)
     }
 
     private func pinArchivedItem(id: UUID) {
@@ -378,7 +373,7 @@ final class HistoryStore {
         while unpinned.count > historyLimit {
             let victim = unpinned.removeFirst()
             removeFiles(of: victim)
-            textCache[victim.id] = nil
+            if cachedText?.id == victim.id { cachedText = nil }
             items.removeAll { $0.id == victim.id }
         }
     }
@@ -399,8 +394,8 @@ final class HistoryStore {
     }
 
     private func scheduleSave() {
-        saveGeneration += 1
-        let generation = saveGeneration
+        Self.saveGeneration += 1
+        let generation = Self.saveGeneration
         saveTask?.cancel()
         saveTask = Task { @MainActor in
             do {
@@ -408,73 +403,87 @@ final class HistoryStore {
             } catch {
                 return
             }
-            guard !Task.isCancelled, generation == self.saveGeneration else { return }
+            guard !Task.isCancelled else { return }
             guard let data = self.encodedData() else { return }
-            let url = self.historyFileURL
-            Task.detached {
-                await HistoryFileWriter.shared.write(data: data, url: url, generation: generation)
-            }
+            HistoryFileWriter.shared.enqueue(data: data, url: self.historyFileURL, generation: generation)
         }
     }
 
     private func load() {
-        loadCurrentItems()
-        loadArchivedDays()
+        let liveIndexLoaded = loadCurrentItems()
+        // An old quarantined index may still reference sidecars after later relaunches.
+        let entries = try? FileManager.default.contentsOfDirectory(atPath: root.path)
+        let safeToClean = liveIndexLoaded && entries?.contains(where: { $0.hasPrefix("history.json.broken-") }) == false
+        let archivesLoaded = loadArchivedDays()
         dropArchivedItemsThatAreStillLive()
         archivePastDaysIfNeeded()
-        cleanupOrphans()
+        if safeToClean && archivesLoaded { cleanupOrphans() }
     }
 
-    private func loadCurrentItems() {
+    private func loadCurrentItems() -> Bool {
         let url = historyFileURL
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
         do {
             let data = try Data(contentsOf: url)
             items = try makeDecoder().decode([ClipItem].self, from: data)
+            return true
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            // A previous recovery may have quarantined the index before relaunch.
+        } catch is DecodingError {
+            do {
+                let broken = root.appending(path: "history.json.broken-\(UUID().uuidString)")
+                try FileManager.default.moveItem(at: url, to: broken)
+            } catch {
+                canSaveLiveIndex = false
+            }
+            Logger.store.error("Invalid live index. Preserving clipboard files.")
         } catch {
-            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-            let broken = root.appending(path: "history.json.broken-\(stamp)")
-            try? FileManager.default.moveItem(at: url, to: broken)
-            items = []
-            Logger.store.error("History file was corrupt and moved aside: \(error.localizedDescription, privacy: .public)")
+            canSaveLiveIndex = false
+            Logger.store.error("Cannot read live index: \(error.localizedDescription, privacy: .public)")
         }
+        if let backup = try? Data(contentsOf: url.appendingPathExtension("backup")),
+           let recovered = try? makeDecoder().decode([ClipItem].self, from: backup) {
+            items = recovered
+        }
+        return false
     }
 
-    private func loadArchivedDays() {
+    private func loadArchivedDays() -> Bool {
         let daysRoot = root.appending(path: "days", directoryHint: .isDirectory)
-        guard let folders = try? FileManager.default.contentsOfDirectory(
-            at: daysRoot,
-            includingPropertiesForKeys: [.isDirectoryKey]
-        ) else {
-            archivedDays = []
-            return
+        let folders: [URL]
+        do {
+            folders = try FileManager.default.contentsOfDirectory(at: daysRoot, includingPropertiesForKeys: [.isDirectoryKey])
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return true
+        } catch {
+            return false
         }
 
         var days: [DayArchive] = []
         for folder in folders {
             let id = folder.lastPathComponent
-            guard date(fromDayID: id) != nil else { continue }
-            let values = try? folder.resourceValues(forKeys: [.isDirectoryKey])
-            guard values?.isDirectory == true else { continue }
+            guard let date = date(fromDayID: id) else { continue }
+            guard let values = try? folder.resourceValues(forKeys: [.isDirectoryKey]) else {
+                unreadableDays.insert(id)
+                continue
+            }
+            guard values.isDirectory == true else { continue }
             let itemsURL = folder.appending(path: "items.json")
-            guard FileManager.default.fileExists(atPath: itemsURL.path) else { continue }
+
             do {
                 let data = try Data(contentsOf: itemsURL)
                 let decoded = try makeDecoder().decode([ClipItem].self, from: data)
-                guard let date = date(fromDayID: id) else { continue }
-                if decoded.isEmpty {
-                    if !liveItemsReferenceDayFolder(id) {
-                        removeDayFolder(id)
-                    }
-                    continue
-                }
+                guard !decoded.isEmpty else { continue }
                 days.append(DayArchive(id: id, date: date, items: decoded))
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                continue
             } catch {
+                unreadableDays.insert(id)
                 Logger.store.error("Failed to read day archive \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         }
         archivedDays = days
         sortArchivedDays()
+        return unreadableDays.isEmpty
     }
 
     private func dropArchivedItemsThatAreStillLive() {
@@ -504,6 +513,12 @@ final class HistoryStore {
             guard writeDay(day) else { return false }
             archivedDays[index] = day
             return true
+        }
+        // An unreadable directory listing must not turn an existing archive into a new one.
+        let existingURL = url(forRelative: "days/\(id)/items.json")
+        if FileManager.default.fileExists(atPath: existingURL.path) {
+            guard let data = try? Data(contentsOf: existingURL),
+                  (try? makeDecoder().decode([ClipItem].self, from: data))?.isEmpty == true else { return false }
         }
         let archive = DayArchive(id: id, date: date(fromDayID: id) ?? fresh[0].createdAt, items: fresh)
         guard writeDay(archive) else { return false }
@@ -689,19 +704,30 @@ final class HistoryStore {
     }
 
     private func encodedData() -> Data? {
-        try? makeEncoder().encode(items)
+        guard canSaveLiveIndex else { return nil }
+        return try? makeEncoder().encode(items)
     }
 
     private func makeEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
+        encoder.dateEncodingStrategy = .deferredToDate
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return encoder
     }
 
     private func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let value = try decoder.singleValueContainer()
+            if let seconds = try? value.decode(Double.self) {
+                return Date(timeIntervalSinceReferenceDate: seconds)
+            }
+            let legacy = try value.decode(String.self)
+            guard let date = try? Date.ISO8601FormatStyle().parse(legacy) else {
+                throw DecodingError.dataCorruptedError(in: value, debugDescription: "Invalid date")
+            }
+            return date
+        }
         return decoder
     }
 
@@ -766,32 +792,46 @@ final class HistoryStore {
     }
 }
 
-private actor HistoryFileWriter {
+private final class HistoryFileWriter: Sendable {
     static let shared = HistoryFileWriter()
-    private var appliedGeneration: [String: Int] = [:]
+    private let queue = DispatchQueue(label: "ClipboardMemory.history-writer")
+    // Accessed only on queue.
+    nonisolated(unsafe) private var appliedGeneration: [String: Int] = [:]
+
+    func enqueue(data: Data, url: URL, generation: Int) {
+        queue.async { self.write(data: data, url: url, generation: generation) }
+    }
+
+    func flush(data: Data, url: URL, generation: Int) -> Bool {
+        queue.sync { write(data: data, url: url, generation: generation) }
+    }
 
     @discardableResult
-    func write(data: Data, url: URL, generation: Int) -> Bool {
+    private func write(data: Data, url: URL, generation: Int) -> Bool {
         let key = url.path
         guard generation >= appliedGeneration[key] ?? 0 else { return false }
         appliedGeneration[key] = generation
         do {
             try data.write(to: url, options: .atomic)
-            return true
         } catch {
             Logger.store.error("Failed to save history: \(error.localizedDescription, privacy: .public)")
             return false
         }
+        // Keep a recovery copy of the committed index without duplicating attachments.
+        let backup = url.appendingPathExtension("backup")
+        do {
+            try data.write(to: backup, options: .atomic)
+        } catch {
+            try? FileManager.default.removeItem(at: backup)
+            Logger.store.error("Failed to update recovery index: \(error.localizedDescription, privacy: .public)")
+        }
+        return true
     }
 }
 
 private struct RelocatedFile {
     var path: String?
     var succeeded: Bool
-}
-
-private final class ResultBox: @unchecked Sendable {
-    var ok = false
 }
 
 private final class NotificationToken: @unchecked Sendable {

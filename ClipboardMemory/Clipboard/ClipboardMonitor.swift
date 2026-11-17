@@ -21,9 +21,7 @@ final class ClipboardMonitor {
     private let store: HistoryStore
     private var timer: Timer?
     private var activityToken: NSObjectProtocol?
-    private var debounceTask: Task<Void, Never>?
     private var lastChangeCount = 0
-    private var pendingCount: Int?
     private(set) var accessNotice: PasteboardAccessNotice?
 
     init(store: HistoryStore) {
@@ -49,8 +47,6 @@ final class ClipboardMonitor {
     func stop() {
         timer?.invalidate()
         timer = nil
-        debounceTask?.cancel()
-        debounceTask = nil
         if let activityToken {
             ProcessInfo.processInfo.endActivity(activityToken)
             self.activityToken = nil
@@ -59,9 +55,6 @@ final class ClipboardMonitor {
 
     func noteOwnChange(_ changeCount: Int) {
         lastChangeCount = changeCount
-        pendingCount = nil
-        debounceTask?.cancel()
-        debounceTask = nil
     }
 
     func refreshAccessNotice() {
@@ -84,45 +77,22 @@ final class ClipboardMonitor {
         let count = NSPasteboard.general.changeCount
         if store.isPaused {
             lastChangeCount = count
-            pendingCount = nil
-            debounceTask?.cancel()
-            debounceTask = nil
             return
         }
-        guard count != lastChangeCount, pendingCount != count else { return }
-        scheduleCapture(expectedCount: count)
-    }
-
-    private func scheduleCapture(expectedCount: Int) {
-        pendingCount = expectedCount
-        debounceTask?.cancel()
-        debounceTask = Task { @MainActor in
-            do {
-                try await Task.sleep(for: .milliseconds(120))
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            let latest = NSPasteboard.general.changeCount
-            if latest != expectedCount {
-                pendingCount = nil
-                self.poll()
-                return
-            }
-            self.capture(count: latest)
-        }
+        guard count != lastChangeCount else { return }
+        capture(count: count)
     }
 
     private func capture(count: Int) {
         lastChangeCount = count
-        pendingCount = nil
         if #available(macOS 15.4, *), NSPasteboard.general.accessBehavior == .alwaysDeny {
             return
         }
 
-        let snapshot = ClipboardReader.snapshot(from: .general)
-        let decision = ClipboardReader.decide(snapshot, redactSecrets: store.redactSecrets)
         let source = SourceApp.frontmost
+        let snapshot = ClipboardReader.snapshot(from: .general)
+        guard NSPasteboard.general.changeCount == count else { return }
+        let decision = ClipboardReader.decide(snapshot, redactSecrets: store.redactSecrets)
         switch decision {
         case .skip:
             break

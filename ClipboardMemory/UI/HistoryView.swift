@@ -9,6 +9,57 @@ enum ClipFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+struct HistorySearch: Equatable, Sendable {
+    struct Entry: Equatable, Sendable {
+        let id: UUID
+        let text: String?
+        let file: URL?
+        var appName: String? = nil
+    }
+
+    let query: String
+    let entries: [Entry]
+
+    func matchingIDs() async -> Set<UUID> {
+        let needle = query.lowercased()
+        let asciiNeedle = needle.utf8.allSatisfy { $0 < 128 } ? Array(needle.utf8) : nil
+        let worker = Task.detached(priority: .userInitiated) {
+            var matches = Set<UUID>()
+            for entry in entries {
+                if Task.isCancelled { break }
+                let matchesQuery = autoreleasepool {
+                    if entry.appName?.lowercased().contains(needle) == true { return true }
+                    let text = entry.text ?? entry.file.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+                    guard let text else { return false }
+                    return Self.contains(text, needle: needle, asciiNeedle: asciiNeedle)
+                }
+                if matchesQuery { matches.insert(entry.id) }
+            }
+            return matches
+        }
+        return await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
+    private static func contains(_ text: String, needle: String, asciiNeedle: [UInt8]?) -> Bool {
+        var folded = text.lowercased()
+        if let asciiNeedle {
+            let match = folded.withUTF8 { bytes -> Bool? in
+                guard bytes.allSatisfy({ $0 < 128 }) else { return nil }
+                return asciiNeedle.withUnsafeBytes { pattern in
+                    memmem(bytes.baseAddress, bytes.count, pattern.baseAddress, pattern.count) != nil
+                }
+            }
+            if let match { return match }
+        }
+        // Preserve canonical equivalence when either string contains Unicode.
+        return folded.contains(needle)
+    }
+}
+
 @MainActor
 @Observable
 final class HistorySession {
@@ -17,6 +68,10 @@ final class HistorySession {
     var selection: UUID?
     var selectedDayID: String?
     weak var searchField: NSSearchField?
+    private var matchedIDs = Set<UUID>()
+    private var matchedQuery = ""
+
+    var isSearching: Bool { !needle.isEmpty && needle != matchedQuery }
 
     func reset(in store: HistoryStore) {
         store.archivePastDaysIfNeeded()
@@ -39,27 +94,52 @@ final class HistorySession {
         selection = visibleItems(in: store).first?.id
     }
 
-    func visibleItems(in store: HistoryStore) -> [ClipItem] {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return baseItems(in: store).filter { item in
-            switch filter {
-            case .all:
-                break
-            case .text:
-                if item.kind != .text { return false }
-            case .image:
-                if item.kind != .image { return false }
-            }
-            guard !needle.isEmpty else { return true }
-            switch item.kind {
-            case .text:
-                return (store.text(for: item) ?? "").lowercased().contains(needle)
-            case .image:
-                let caption = ClipFormatting.title(for: item, store: store).lowercased()
-                let appName = (item.sourceAppName ?? "").lowercased()
-                return caption.contains(needle) || appName.contains(needle)
-            }
+    private var needle: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func filteredItems(in store: HistoryStore) -> [ClipItem] {
+        let items = baseItems(in: store)
+        switch filter {
+        case .all: return items
+        case .text: return items.filter { $0.kind == .text }
+        case .image: return items.filter { $0.kind == .image }
         }
+    }
+
+    func searchRequest(in store: HistoryStore) -> HistorySearch? {
+        guard !needle.isEmpty else { return nil }
+        let entries = filteredItems(in: store).map { item in
+            if item.kind == .image {
+                let caption = ClipFormatting.title(for: item, store: store)
+                return HistorySearch.Entry(id: item.id, text: caption, file: nil, appName: item.sourceAppName)
+            }
+            return HistorySearch.Entry(id: item.id, text: item.text, file: item.textFileName.map(store.url(forRelative:)))
+        }
+        return HistorySearch(query: needle, entries: entries)
+    }
+
+    func updateSearch(_ request: HistorySearch?) async {
+        guard !Task.isCancelled else { return }
+        guard let request else {
+            matchedQuery = ""
+            matchedIDs.removeAll()
+            return
+        }
+        let matches = await request.matchingIDs()
+        guard !Task.isCancelled, needle == request.query else { return }
+        matchedIDs = matches
+        matchedQuery = request.query
+        if selection.map(matches.contains) != true {
+            selection = request.entries.first { matches.contains($0.id) }?.id
+        }
+    }
+
+    func visibleItems(in store: HistoryStore) -> [ClipItem] {
+        let items = filteredItems(in: store)
+        guard !needle.isEmpty else { return items }
+        guard needle == matchedQuery else { return [] }
+        return items.filter { matchedIDs.contains($0.id) }
     }
 
     private func baseItems(in store: HistoryStore) -> [ClipItem] {
@@ -102,9 +182,17 @@ enum ClipFormatting {
     static func title(for item: ClipItem, store: HistoryStore) -> String {
         switch item.kind {
         case .text:
-            let text = store.text(for: item) ?? ""
-            let line = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
-            return line.isEmpty ? "Text" : line
+            let prefix: String
+            if let text = item.text {
+                prefix = String(text.prefix(256))
+            } else if let name = item.textFileName,
+                      let file = try? FileHandle(forReadingFrom: store.url(forRelative: name)) {
+                defer { try? file.close() }
+                prefix = String(decoding: (try? file.read(upToCount: 1024)) ?? Data(), as: UTF8.self)
+            } else {
+                return "Text"
+            }
+            return prefix.split(whereSeparator: \.isNewline).first.map(String.init) ?? "Text"
         case .image:
             guard let size = item.pixelSize else { return "Image" }
             return "Image \(Int(size.width))×\(Int(size.height))"
@@ -157,6 +245,7 @@ struct HistoryView: View {
 
     var body: some View {
         let visible = session.visibleItems(in: store)
+        let request = session.searchRequest(in: store)
         VStack(spacing: 10) {
             dayBar
             SearchField(text: session.query, dark: chrome == .notch) { newValue in
@@ -192,6 +281,7 @@ struct HistoryView: View {
 
             footer(visibleCount: visible.count)
         }
+        .task(id: request) { await session.updateSearch(request) }
         .padding(chrome == .notch ? 14 : 12)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
@@ -337,7 +427,10 @@ struct HistoryView: View {
 
     private func list(_ visible: [ClipItem]) -> some View {
         Group {
-            if visible.isEmpty {
+            if session.isSearching {
+                ProgressView("Searching…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if visible.isEmpty {
                 emptyState(
                     title: emptyTitle,
                     text: emptyMessage

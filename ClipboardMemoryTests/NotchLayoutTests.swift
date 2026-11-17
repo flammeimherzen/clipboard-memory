@@ -32,4 +32,46 @@ struct NotchLayoutTests {
         #expect(!hit.contains(CGPoint(x: 40, y: 1150)))
         #expect(!hit.contains(CGPoint(x: 1700, y: 1150)))
     }
+
+    @Test func externalDisplayActivatesOnlyAtTheVeryTopWithinTheCenteredNotch() {
+        let hit = NotchLayout.idleHitRect(
+            notch: notch, screenFrame: screen, visibleFrame: visible, activationMode: .topEdge
+        )
+        for x: CGFloat in [790, 900, 1009] {
+            #expect(NotchLayout.containsIdlePointer(
+                CGPoint(x: x, y: screen.maxY), in: hit, activationMode: .topEdge
+            ))
+            #expect(hit.contains(CGPoint(x: x, y: screen.maxY - 0.5)))
+            #expect(!hit.contains(CGPoint(x: x, y: screen.maxY - 2)))
+            #expect(!hit.contains(CGPoint(x: x, y: visible.maxY)))
+        }
+        for x: CGFloat in [0, 40, 789, 1010, 1700, 1799] {
+            #expect(!NotchLayout.containsIdlePointer(
+                CGPoint(x: x, y: screen.maxY), in: hit, activationMode: .topEdge
+            ))
+            #expect(!hit.contains(CGPoint(x: x, y: screen.maxY - 0.5)))
+        }
+        #expect(!NotchLayout.containsIdlePointer(
+            CGPoint(x: 900, y: screen.maxY + 0.5), in: hit, activationMode: .topEdge
+        ))
+        #expect(!NotchLayout.containsIdlePointer(
+            CGPoint(x: 900, y: screen.maxY - 2), in: hit, activationMode: .topEdge
+        ))
+    }
+
+    @Test func externalDisplayEdgeUsesScreenCoordinates() {
+        let external = NSRect(x: -2560, y: -300, width: 2560, height: 1440)
+        let hit = NotchLayout.idleHitRect(
+            notch: notch,
+            screenFrame: external,
+            visibleFrame: external.insetBy(dx: 0, dy: 30),
+            activationMode: .topEdge
+        )
+        #expect(hit.midX == external.midX)
+        #expect(hit.width == notch.width)
+        #expect(hit.maxY == external.maxY)
+        #expect(hit.height == 1)
+        #expect(hit.contains(CGPoint(x: -1280, y: 1139.5)))
+        #expect(!hit.contains(CGPoint(x: -1280, y: 1138)))
+    }
 }

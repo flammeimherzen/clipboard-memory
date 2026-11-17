@@ -2,6 +2,13 @@ import AppKit
 import QuartzCore
 import SwiftUI
 
+enum NotchActivationMode {
+    case notch
+    case topEdge
+
+    var entryPhase: NotchPhase { self == .topEdge ? .open : .hover }
+}
+
 enum NotchLayout {
     static func windowFrame(
         phase: NotchPhase,
@@ -29,8 +36,32 @@ enum NotchLayout {
         return rect
     }
 
-    static func idleHitRect(notch: NSRect, screenFrame: NSRect, visibleFrame: NSRect) -> NSRect {
-        notch
+    static func idleHitRect(
+        notch: NSRect,
+        screenFrame: NSRect,
+        visibleFrame: NSRect,
+        activationMode: NotchActivationMode = .notch
+    ) -> NSRect {
+        switch activationMode {
+        case .notch:
+            return notch
+        case .topEdge:
+            return NSRect(
+                x: screenFrame.midX - notch.width / 2,
+                y: screenFrame.maxY - 1,
+                width: notch.width,
+                height: 1
+            )
+        }
+    }
+
+    static func containsIdlePointer(_ point: NSPoint, in hitRect: NSRect, activationMode: NotchActivationMode) -> Bool {
+        if activationMode == .topEdge {
+            // AppKit can report the pointer exactly on maxY at the screen's top edge.
+            return point.x >= hitRect.minX && point.x < hitRect.maxX
+                && point.y >= hitRect.minY && point.y <= hitRect.maxY
+        }
+        return hitRect.contains(point)
     }
 }
 
@@ -38,9 +69,19 @@ struct NotchMetrics {
     var screen: NSScreen
     var notchRect: NSRect
     var isHardwareNotch: Bool
+    var activationMode: NotchActivationMode
 
     static func resolve() -> NotchMetrics {
-        for screen in NSScreen.screens {
+        let screens = NSScreen.screens
+        // In clamshell mode the built-in display is absent from the active screens.
+        let hasBuiltInDisplay = screens.contains { screen in
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return false
+            }
+            return CGDisplayIsBuiltin(number.uint32Value) != 0
+        }
+        let activationMode: NotchActivationMode = hasBuiltInDisplay ? .notch : .topEdge
+        for screen in screens {
             guard let left = screen.auxiliaryTopLeftArea,
                   let right = screen.auxiliaryTopRightArea,
                   left.width > 1, right.width > 1, right.minX > left.maxX else { continue }
@@ -50,18 +91,18 @@ struct NotchMetrics {
                 width: right.minX - left.maxX,
                 height: max(left.height, right.height)
             )
-            return NotchMetrics(screen: screen, notchRect: rect, isHardwareNotch: true)
+            return NotchMetrics(screen: screen, notchRect: rect, isHardwareNotch: true, activationMode: activationMode)
         }
         let screen = NSScreen.main ?? NSScreen.screens[0]
         let width: CGFloat = 188
-        let height: CGFloat = 34
+        let height: CGFloat = activationMode == .topEdge ? 1 : 34
         let rect = NSRect(
             x: screen.frame.midX - width / 2,
             y: screen.frame.maxY - height,
             width: width,
             height: height
         )
-        return NotchMetrics(screen: screen, notchRect: rect, isHardwareNotch: false)
+        return NotchMetrics(screen: screen, notchRect: rect, isHardwareNotch: false, activationMode: activationMode)
     }
 }
 
@@ -117,10 +158,9 @@ final class NotchController: NSObject {
     func start() {
         metrics = NotchMetrics.resolve()
         model.notchBandHeight = metrics.notchRect.height
-        panel.ignoresMouseEvents = false
         panel.colorSpace = metrics.screen.colorSpace
         panel.setFrame(windowFrame(for: .idle), display: true)
-        panel.orderFrontRegardless()
+        updateIdleVisibility()
         installPointerMonitors()
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -131,8 +171,8 @@ final class NotchController: NSObject {
                 self?.screenChanged()
             }
         }
-        if idleHitRect().contains(NSEvent.mouseLocation) {
-            setPhase(.hover)
+        if isIdleTrigger(NSEvent.mouseLocation) {
+            setPhase(metrics.activationMode.entryPhase)
         }
     }
 
@@ -146,17 +186,24 @@ final class NotchController: NSObject {
     }
 
     private func screenChanged() {
+        collapseWork?.cancel()
+        animationID += 1
         metrics = NotchMetrics.resolve()
         model.notchBandHeight = metrics.notchRect.height
         panel.colorSpace = metrics.screen.colorSpace
-        animationID += 1
-        panel.setFrame(windowFrame(for: phase), display: true)
+        phase = .idle
+        model.phase = .idle
+        model.showsContent = false
+        panel.allowsKey = false
+        removeKeyMonitor()
+        panel.setFrame(windowFrame(for: .idle), display: true)
+        updateIdleVisibility()
     }
 
     private func pointerEntered() {
         collapseWork?.cancel()
-        if phase == .idle {
-            setPhase(.hover)
+        if phase == .idle, isIdleTrigger(NSEvent.mouseLocation) {
+            setPhase(metrics.activationMode.entryPhase)
         }
     }
 
@@ -190,8 +237,13 @@ final class NotchController: NSObject {
         let point = NSEvent.mouseLocation
         switch phase {
         case .idle:
-            guard idleHitRect().contains(point) else { return false }
-            setPhase(isDown ? .open : .hover)
+            guard isIdleTrigger(point) else { return false }
+            if metrics.activationMode == .topEdge {
+                guard !isDown else { return false }
+                setPhase(.open)
+            } else {
+                setPhase(isDown ? .open : .hover)
+            }
             return false
         case .hover:
             let hoverFrame = windowFrame(for: .hover)
@@ -263,17 +315,27 @@ final class NotchController: NSObject {
             model.showsContent = false
             panel.allowsKey = false
             removeKeyMonitor()
-            panel.ignoresMouseEvents = false
+            panel.ignoresMouseEvents = metrics.activationMode == .topEdge
             let target = windowFrame(for: .idle)
             if previous == .idle || !panel.isVisible {
                 panel.setFrame(target, display: true)
-                panel.orderFrontRegardless()
+                updateIdleVisibility()
             } else {
                 animateFrame(to: target, duration: 0.2) { [weak self] in
                     guard let self, self.phase == .idle else { return }
-                    self.panel.orderFrontRegardless()
+                    self.updateIdleVisibility()
                 }
             }
+        }
+    }
+
+    private func updateIdleVisibility() {
+        let hidden = metrics.activationMode == .topEdge
+        panel.ignoresMouseEvents = hidden
+        if hidden {
+            panel.orderOut(nil)
+        } else {
+            panel.orderFrontRegardless()
         }
     }
 
@@ -286,12 +348,14 @@ final class NotchController: NSObject {
         )
     }
 
-    private func idleHitRect() -> NSRect {
-        NotchLayout.idleHitRect(
+    private func isIdleTrigger(_ point: NSPoint) -> Bool {
+        let hitRect = NotchLayout.idleHitRect(
             notch: metrics.notchRect,
             screenFrame: metrics.screen.frame,
-            visibleFrame: metrics.screen.visibleFrame
+            visibleFrame: metrics.screen.visibleFrame,
+            activationMode: metrics.activationMode
         )
+        return NotchLayout.containsIdlePointer(point, in: hitRect, activationMode: metrics.activationMode)
     }
 
     private func animateFrame(

@@ -46,29 +46,28 @@ enum ClipboardReader {
             return value
         }
 
-        var pngData = data(for: NSPasteboard.PasteboardType.png.rawValue)
-        var jpegData = data(for: "public.jpeg")
-        var otherImageData = data(for: NSPasteboard.PasteboardType.tiff.rawValue)
-            ?? data(for: "NeXT TIFF v4.0 pasteboard type")
-            ?? data(for: "com.compuserve.gif")
-            ?? data(for: "public.gif")
-            ?? data(for: "public.heic")
-            ?? data(for: "public.heif")
         let fileURL = Self.fileURL(from: pasteboard)
-        var prefersImage = false
-
-        if let fileURL, Self.isImageFile(fileURL) {
-            prefersImage = true
-            if let fileData = Self.imageFileData(at: fileURL) {
-                switch fileURL.pathExtension.lowercased() {
-                case "jpg", "jpeg":
-                    jpegData = fileData
-                case "png":
-                    pngData = fileData
-                default:
-                    otherImageData = fileData
-                }
+        var prefersImage = fileURL.map(isImageFile) ?? false
+        var pngData: Data?
+        var jpegData: Data?
+        var otherImageData: Data?
+        if prefersImage, let fileURL, let fileData = imageFileData(at: fileURL) {
+            switch fileURL.pathExtension.lowercased() {
+            case "jpg", "jpeg": jpegData = fileData
+            case "png": pngData = fileData
+            default: otherImageData = fileData
             }
+        } else if let png = data(for: NSPasteboard.PasteboardType.png.rawValue) {
+            pngData = png
+        } else if let jpeg = data(for: "public.jpeg") {
+            jpegData = jpeg
+        } else {
+            otherImageData = data(for: NSPasteboard.PasteboardType.tiff.rawValue)
+                ?? data(for: "NeXT TIFF v4.0 pasteboard type")
+                ?? data(for: "com.compuserve.gif")
+                ?? data(for: "public.gif")
+                ?? data(for: "public.heic")
+                ?? data(for: "public.heif")
         }
 
         if pngData == nil, jpegData == nil, otherImageData == nil,
@@ -232,7 +231,6 @@ enum ClipboardReader {
     }
 }
 
-@MainActor
 enum ImageTranscoder {
     static func pngData(from data: Data) -> (Data, PixelSize)? {
         if let source = CGImageSourceCreateWithData(data as CFData, nil),
